@@ -1,8 +1,10 @@
-# discover_urls.py
+# discover_urls.py (全文)
 import os
 import sys
 import requests
 import configparser
+import time
+import random
 from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
@@ -12,81 +14,93 @@ from urllib3.util.retry import Retry
 from url_normalize import url_normalize
 
 def fetch_links_from_url(url: str, config, session) -> set:
-    """単一のURLからリンクをすべて抽出し、正規化してセットとして返す"""
+    # (この関数の中身は変更ありません)
     target_domain = config.get('General', 'TARGET_DOMAIN')
     request_timeout = config.getint('General', 'REQUEST_TIMEOUT')
     found_links = set()
-    
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = session.get(url, timeout=request_timeout, headers=headers, allow_redirects=True)
         response.raise_for_status()
-        
         content_type = response.headers.get("content-type", "").lower()
-
         if "html" in content_type:
             soup = BeautifulSoup(response.content, 'html.parser')
-            for a_tag in soup.find_all('a', href=True):
+            for a_tag in soup.find_all('a', href=lambda href: href and href.startswith('/medicus-bin/japic_med')):
                 try:
                     link = urljoin(url, a_tag['href'])
                     normalized_link = url_normalize(link)
-                    
                     if urlparse(normalized_link).netloc == target_domain:
                         found_links.add(normalized_link)
                 except Exception:
                     pass
     except Exception as e:
-        # ログが多すぎる場合はこの行をコメントアウト
         print(f"  [!] エラー: {url} - {e}", file=sys.stderr)
-    
     return found_links
 
 def main():
     config = configparser.ConfigParser()
     config.read('config.ini')
     
-    index_pages = list(filter(None, config.get('Seeds', 'INDEX_PAGES').strip().split('\n')))
+    start_url = config.get('General', 'START_URL')
     max_workers = config.getint('Discoverer', 'MAX_DISCOVER_WORKERS')
-    crawl_depth = config.getint('Discoverer', 'CRAWL_DEPTH')
+    # レートリミット設定を読み込む
+    discover_accesses_per_minute = config.getint('RateLimit', 'DISCOVER_ACCESSES_PER_MINUTE')
 
     supabase_url, supabase_key = os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY")
     if not supabase_url or not supabase_key: raise ValueError("環境変数を設定してください。")
     supabase = create_client(supabase_url, supabase_key)
     
-    print(f"--- 「多階層クロール(深さ: {crawl_depth})」によるURL発見処理開始 ---")
+    print("--- ページネーション・クロール (レートリミットモード) 開始 ---")
 
     session = requests.Session()
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
     session.mount('https://', HTTPAdapter(max_retries=retries))
-    session.mount('http://', HTTPAdapter(max_retries=retries))
 
-    # --- 階層的クロールのメインロジック ---
+    # --- ステップ1 & 2: 最終ページを特定し、全ページURLを生成 ---
+    print(f"[*] 最初のページから最大ページ番号を取得します: {start_url}")
+    pages_to_scrape = []
+    try:
+        response = session.get(start_url, timeout=30)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+        page_numbers = [int(a['data-page']) for a in soup.find_all('a', attrs={'data-page': True})]
+        last_page = max(page_numbers) if page_numbers else 1
+        print(f"  [+] 最大ページ番号 {last_page} を特定しました。")
+        base_url = start_url.split('?')[0]
+        pages_to_scrape = [f"{base_url}?page={i}&display=med" for i in range(1, last_page + 1)]
+        print(f"[*] {len(pages_to_scrape)}件のインデックスページをクロール対象とします。")
+    except Exception as e:
+        print(f"  [!] 最大ページ番号の取得に失敗: {e}", file=sys.stderr)
+        pages_to_scrape.append(start_url)
+    
+    # --- ステップ3: 全ページからリンクをバッチ処理で収集 ---
     all_discovered_links = set()
-    visited_urls = set()
-    # 最初の階層(depth 0)はインデックスページ
-    urls_for_next_level = set(url_normalize(url) for url in index_pages)
+    discover_batch_size = 20 # 一度に処理するインデックスページの数
 
-    for depth in range(crawl_depth):
-        current_level_urls = urls_for_next_level - visited_urls
-        if not current_level_urls:
-            print(f"[*] 深さ {depth}: 新しい探索対象URLがないため終了します。")
-            break
-
-        print(f"\n[*] 深さ {depth + 1}/{crawl_depth}: {len(current_level_urls)}件のURLを検証します...")
-        
-        visited_urls.update(current_level_urls)
-        all_discovered_links.update(current_level_urls)
-        urls_for_next_level.clear()
+    for i in range(0, len(pages_to_scrape), discover_batch_size):
+        batch_start_time = time.time()
+        batch = pages_to_scrape[i:i + discover_batch_size]
+        print(f"\n[*] インデックスページ {i+1}～{i+len(batch)} の処理を開始します...")
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_url = {executor.submit(fetch_links_from_url, url, config, session): url for url in current_level_urls}
-            
+            future_to_url = {executor.submit(fetch_links_from_url, url, config, session): url for url in batch}
             for future in as_completed(future_to_url):
                 try:
-                    # 次の階層で探索するURLを収集
-                    urls_for_next_level.update(future.result())
+                    all_discovered_links.update(future.result())
                 except Exception as exc:
                     print(f'[!] ワーカーで例外が発生しました: {exc}', file=sys.stderr)
+        
+        # ▼▼▼▼▼ レートリミットのロジック ▼▼▼▼▼
+        batch_end_time = time.time()
+        elapsed_time = batch_end_time - batch_start_time
+        
+        if discover_accesses_per_minute > 0:
+            required_time = (60.0 / discover_accesses_per_minute) * len(batch)
+            if elapsed_time < required_time:
+                wait_time = required_time - elapsed_time
+                print(f"  [*] レートリミットのため {wait_time:.2f} 秒待機します。")
+                time.sleep(wait_time)
+        # ▲▲▲▲▲ ここまで追加 ▲▲▲▲▲
 
     if not all_discovered_links:
         print("[*] 解析対象のURLは発見されませんでした。")
