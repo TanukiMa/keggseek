@@ -1,4 +1,4 @@
-# discover_urls.py (全文)
+# discover_urls.py
 import os
 import sys
 import requests
@@ -14,27 +14,36 @@ from urllib3.util.retry import Retry
 from url_normalize import url_normalize
 
 def fetch_links_from_url(url: str, config, session) -> set:
-    # (この関数の中身は変更ありません)
+    """単一のURLからリンクをすべて抽出し、正規化してセットとして返す"""
     target_domain = config.get('General', 'TARGET_DOMAIN')
     request_timeout = config.getint('General', 'REQUEST_TIMEOUT')
     found_links = set()
+    
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = session.get(url, timeout=request_timeout, headers=headers, allow_redirects=True)
         response.raise_for_status()
+        
         content_type = response.headers.get("content-type", "").lower()
+
         if "html" in content_type:
             soup = BeautifulSoup(response.content, 'html.parser')
-            for a_tag in soup.find_all('a', href=lambda href: href and href.startswith('/medicus-bin/japic_med')):
+            
+            # ▼▼▼▼▼ リンク抽出条件を修正 ▼▼▼▼▼
+            # 'href'属性に'japic_med?japic_code='という文字列が含まれる<a>タグをすべて探す
+            for a_tag in soup.find_all('a', href=lambda href: href and 'japic_med?japic_code=' in href):
+            # ▲▲▲▲▲ ここまで修正 ▲▲▲▲▲
                 try:
                     link = urljoin(url, a_tag['href'])
                     normalized_link = url_normalize(link)
+                    
                     if urlparse(normalized_link).netloc == target_domain:
                         found_links.add(normalized_link)
                 except Exception:
                     pass
     except Exception as e:
         print(f"  [!] エラー: {url} - {e}", file=sys.stderr)
+    
     return found_links
 
 def main():
@@ -43,7 +52,6 @@ def main():
     
     start_url = config.get('General', 'START_URL')
     max_workers = config.getint('Discoverer', 'MAX_DISCOVER_WORKERS')
-    # レートリミット設定を読み込む
     discover_accesses_per_minute = config.getint('RateLimit', 'DISCOVER_ACCESSES_PER_MINUTE')
 
     supabase_url, supabase_key = os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY")
@@ -56,26 +64,27 @@ def main():
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
     session.mount('https://', HTTPAdapter(max_retries=retries))
 
-    # --- ステップ1 & 2: 最終ページを特定し、全ページURLを生成 ---
     print(f"[*] 最初のページから最大ページ番号を取得します: {start_url}")
     pages_to_scrape = []
     try:
         response = session.get(start_url, timeout=30)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser')
+        
         page_numbers = [int(a['data-page']) for a in soup.find_all('a', attrs={'data-page': True})]
         last_page = max(page_numbers) if page_numbers else 1
         print(f"  [+] 最大ページ番号 {last_page} を特定しました。")
+
         base_url = start_url.split('?')[0]
         pages_to_scrape = [f"{base_url}?page={i}&display=med" for i in range(1, last_page + 1)]
         print(f"[*] {len(pages_to_scrape)}件のインデックスページをクロール対象とします。")
+
     except Exception as e:
-        print(f"  [!] 最大ページ番号の取得に失敗: {e}", file=sys.stderr)
+        print(f"  [!] 最大ページ番号の取得に失敗しました: {e}", file=sys.stderr)
         pages_to_scrape.append(start_url)
     
-    # --- ステップ3: 全ページからリンクをバッチ処理で収集 ---
     all_discovered_links = set()
-    discover_batch_size = 20 # 一度に処理するインデックスページの数
+    discover_batch_size = 20
 
     for i in range(0, len(pages_to_scrape), discover_batch_size):
         batch_start_time = time.time()
@@ -90,7 +99,6 @@ def main():
                 except Exception as exc:
                     print(f'[!] ワーカーで例外が発生しました: {exc}', file=sys.stderr)
         
-        # ▼▼▼▼▼ レートリミットのロジック ▼▼▼▼▼
         batch_end_time = time.time()
         elapsed_time = batch_end_time - batch_start_time
         
@@ -100,7 +108,6 @@ def main():
                 wait_time = required_time - elapsed_time
                 print(f"  [*] レートリミットのため {wait_time:.2f} 秒待機します。")
                 time.sleep(wait_time)
-        # ▲▲▲▲▲ ここまで追加 ▲▲▲▲▲
 
     if not all_discovered_links:
         print("[*] 解析対象のURLは発見されませんでした。")
