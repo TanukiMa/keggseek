@@ -1,5 +1,5 @@
 # .github/workflows/crawler.yml
-name: New Word Crawler Pipeline (Correct Initialization)
+name: New Word Crawler 4 kegg drug
 
 on:
   schedule:
