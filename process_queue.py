@@ -7,15 +7,15 @@ import requests
 import hashlib
 import sys
 from datetime import datetime, timezone
-from concurrent.futures import ProcessPoolExecutor
 
 from bs4 import BeautifulSoup
 from supabase import create_client, Client
 from sudachipy import tokenizer, dictionary
 
-_WORKER_TOKENIZER = None
+# --- グローバル変数 ---
 _POS_CACHE = {}
 
+# --- ヘルパー関数群 ---
 def get_content_hash(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
@@ -33,17 +33,14 @@ def get_text_from_html(content: bytes) -> str:
         raise RuntimeError(f"HTML解析エラー: {e}")
 
 def analyze_with_sudachi(text: str, tokenizer_obj, debug_mode: bool = False) -> list:
-    """sudachipyを使い、未知の普通名詞を抽出する"""
     if not text.strip() or not tokenizer_obj: return []
     
     chunk_size = 10000
     words = []
-
     try:
         for i in range(0, len(text), chunk_size):
             chunk = text[i:i + chunk_size]
             morphemes = tokenizer_obj.tokenize(chunk)
-            
             for m in morphemes:
                 pos_info = m.part_of_speech()
                 pos_tuple = tuple(pos_info)
@@ -60,24 +57,17 @@ def analyze_with_sudachi(text: str, tokenizer_obj, debug_mode: bool = False) -> 
                         f"pos_id: {pos_id}",
                         file=sys.stderr
                     )
-
                 if is_oov and is_target_pos and len(m.surface()) > 1:
                     if pos_id is not None:
                         words.append({"word": m.surface(), "pos_id": pos_id})
     except Exception as e:
         print(f"  [!] Sudachi解析エラー: {e}", file=sys.stderr)
-
     return words
 
-def worker_process_url(queue_item: dict, supabase_url: str, supabase_key: str, stop_words_set: set, request_timeout: int, config_path: str, pos_cache: dict, debug_mode: bool):
-    global _WORKER_TOKENIZER, _POS_CACHE
-    if _WORKER_TOKENIZER is None:
-        _WORKER_TOKENIZER = dictionary.Dictionary(config_path=config_path).create(mode=tokenizer.Tokenizer.SplitMode.C)
-        _POS_CACHE = pos_cache
-
+def process_single_url(queue_item: dict, supabase_client: Client, stop_words_set: set, request_timeout: int, tokenizer_obj, debug_mode: bool):
+    """単一URLを処理する逐次実行用の関数"""
     url_id, url = queue_item['id'], queue_item['url']
-    supabase: Client = create_client(supabase_url, supabase_key)
-
+    
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(url, timeout=request_timeout, headers=headers)
@@ -85,36 +75,36 @@ def worker_process_url(queue_item: dict, supabase_url: str, supabase_key: str, s
 
         content_type = response.headers.get("content-type", "").lower()
         if "html" not in content_type:
-            supabase.table("crawl_queue").update({"status": "completed", "processed_at": datetime.now(timezone.utc).isoformat()}).eq("id", url_id).execute()
+            supabase_client.table("crawl_queue").update({"status": "completed", "processed_at": datetime.now(timezone.utc).isoformat()}).eq("id", url_id).execute()
             return True
 
         new_hash = get_content_hash(response.content)
-        db_res = supabase.table("crawl_queue").select("content_hash").eq("id", url_id).single().execute()
+        db_res = supabase_client.table("crawl_queue").select("content_hash").eq("id", url_id).single().execute()
         old_hash = db_res.data.get("content_hash") if db_res.data else None
         
         if old_hash == new_hash:
-            supabase.table("crawl_queue").update({"status": "completed", "processed_at": datetime.now(timezone.utc).isoformat()}).eq("id", url_id).execute()
+            supabase_client.table("crawl_queue").update({"status": "completed", "processed_at": datetime.now(timezone.utc).isoformat()}).eq("id", url_id).execute()
             return True
         
         text = get_text_from_html(response.content)
         
         if text:
-            new_words = analyze_with_sudachi(text, _WORKER_TOKENIZER, debug_mode)
+            new_words = analyze_with_sudachi(text, tokenizer_obj, debug_mode)
             filtered_words = [w for w in new_words if w["word"] not in stop_words_set]
             if filtered_words:
-                supabase.table("word_occurrences").delete().eq("source_url", url).execute()
+                supabase_client.table("word_occurrences").delete().eq("source_url", url).execute()
                 for word_data in filtered_words:
-                    upsert_res = supabase.table("unique_words").upsert(
+                    upsert_res = supabase_client.table("unique_words").upsert(
                         {"word": word_data["word"], "pos_id": word_data["pos_id"]},
                         on_conflict="word"
                     ).execute()
                     if upsert_res.data:
                         word_id = upsert_res.data[0]['id']
-                        supabase.table("word_occurrences").insert({
+                        supabase_client.table("word_occurrences").insert({
                             "word_id": word_id, "source_url": url
                         }).execute()
 
-        supabase.table("crawl_queue").update({
+        supabase_client.table("crawl_queue").update({
             "status": "completed", "content_hash": new_hash, "processed_at": datetime.now(timezone.utc).isoformat()
         }).eq("id", url_id).execute()
         return True
@@ -127,50 +117,50 @@ def worker_process_url(queue_item: dict, supabase_url: str, supabase_key: str, s
             update_payload["status"] = "completed"
         else:
             update_payload["status"] = "failed"
-        supabase.table("crawl_queue").update(update_payload).eq("id", url_id).execute()
+        supabase_client.table("crawl_queue").update(update_payload).eq("id", url_id).execute()
         return False
-
     except Exception as e:
         print(f"  [!] 不明なエラー発生: {url} - {e}", file=sys.stderr)
-        supabase.table("crawl_queue").update({
+        supabase_client.table("crawl_queue").update({
             "status": "failed",
             "processed_at": datetime.now(timezone.utc).isoformat(),
             "error_message": str(e)
         }).eq("id", url_id).execute()
         return False
 
-def load_pos_master_to_cache(supabase_client: Client) -> dict:
-    pos_cache = {}
+def load_pos_master_to_cache(supabase_client: Client):
+    """DBからpos_masterを読み込み、高速検索用のキャッシュを作成する"""
+    global _POS_CACHE
+    if _POS_CACHE: return
     print("[*] 品詞マスターデータをDBから読み込んでいます...")
     try:
         response = supabase_client.table("pos_master").select("id,pos1,pos2,pos3,pos4,pos5,pos6").execute()
         for item in response.data:
             key = tuple(item.get(f'pos{i}', '*') for i in range(1, 7))
-            pos_cache[key] = item['id']
-        print(f"  [+] {len(pos_cache)}件の品詞データをキャッシュしました。")
+            _POS_CACHE[key] = item['id']
+        print(f"  [+] {len(_POS_CACHE)}件の品詞データをキャッシュしました。")
     except Exception as e:
         print(f"  [!] 品詞マスターの読み込みに失敗: {e}", file=sys.stderr)
-    return pos_cache
 
 def main():
     config = configparser.ConfigParser()
     config.read('config.ini')
-    max_workers = config.getint('Processor', 'MAX_WORKERS')
+    
     process_batch_size = config.getint('Processor', 'PROCESS_BATCH_SIZE')
     request_timeout = config.getint('General', 'REQUEST_TIMEOUT')
-    target_accesses_per_minute = config.getint('RateLimit', 'TARGET_ACCESSES_PER_MINUTE')
     debug_mode = config.getboolean('Debug', 'PROCESSOR_DEBUG', fallback=False)
 
     supabase_url, supabase_key = os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY")
     if not supabase_url or not supabase_key: raise ValueError("環境変数を設定してください。")
     
-    sudachi_config_path = os.environ.get("SUDACHI_CONFIG_PATH")
-
     supabase_main = create_client(supabase_url, supabase_key)
-    print("--- コンテンツ解析処理開始 ---")
+    print("--- シングルコネクション・コンテンツ解析処理開始 ---")
 
-    pos_cache_for_workers = load_pos_master_to_cache(supabase_main)
+    # Sudachiの初期化 (ユーザー辞書は使わない前提)
+    print(f"[*] Sudachi Tokenizerを初期化します (dict: full)。")
+    tokenizer_obj = dictionary.Dictionary(dict="full").create(mode=tokenizer.Tokenizer.SplitMode.C)
 
+    load_pos_master_to_cache(supabase_main)
     response = supabase_main.table("stop_words").select("word").execute()
     stop_words_set = {item['word'] for item in response.data}
     print(f"[*] {len(stop_words_set)}件の除外ワードを読み込みました。")
@@ -178,40 +168,27 @@ def main():
     total_processed_count = 0
     
     while True:
-        batch_start_time = time.time()
         response = supabase_main.table("crawl_queue").select("id, url").in_("status", ["queued", "failed"]).limit(process_batch_size).execute()
         urls_to_process = response.data
         if not urls_to_process:
             print("[*] 処理対象のURLがキューにありません。終了します。")
             break
-        processing_ids = [item['id'] for item in urls_to_process]
-        
-        chunk_size = 100
-        print(f"[*] {len(processing_ids)}件のURLを処理対象としてロックします...")
-        try:
-            for i in range(0, len(processing_ids), chunk_size):
-                chunk = processing_ids[i:i + chunk_size]
-                supabase_main.table("crawl_queue").update({"status": "processing"}).in_("id", chunk).execute()
-        except Exception as e:
-            print(f"  [!] URLのロック中にDBエラーが発生しました: {e}", file=sys.stderr)
-            continue
 
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(worker_process_url, item, supabase_url, supabase_key, stop_words_set, request_timeout, sudachi_config_path, pos_cache_for_workers, debug_mode) for item in urls_to_process]
-            results = [f.result() for f in futures]
+        processing_ids = [item['id'] for item in urls_to_process]
+        supabase_main.table("crawl_queue").update({"status": "processing"}).in_("id", processing_ids).execute()
+        print(f"[*] {len(urls_to_process)}件のURLをロックしました。")
+
+        success_count = 0
+        for item in urls_to_process:
+            # サーバー負荷軽減のため、リクエストごとに遅延を入れる
+            time.sleep(2) # 2秒に1アクセス
+            result = process_single_url(item, supabase_main, stop_words_set, request_timeout, tokenizer_obj, debug_mode)
+            if result:
+                success_count += 1
         
-        success_count = sum(1 for r in results if r)
-        batch_count = len(results)
+        batch_count = len(urls_to_process)
         total_processed_count += batch_count
         print(f"  [+] 1バッチ処理完了 (成功: {success_count}, 失敗: {batch_count - success_count})")
-        
-        elapsed_time = time.time() - batch_start_time
-        if target_accesses_per_minute > 0:
-            required_time = (60.0 / target_accesses_per_minute) * batch_count
-            if elapsed_time < required_time:
-                wait_time = required_time - elapsed_time
-                print(f"  [*] レートリミットのため {wait_time:.2f} 秒待機します。")
-                time.sleep(wait_time)
     
     print(f"\n--- コンテンツ解析処理終了 ---")
     print(f"今回処理した合計URL数: {total_processed_count}")
