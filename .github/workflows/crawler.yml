@@ -32,7 +32,7 @@ jobs:
         with: { python-version: '3.10' }
       - name: Install GiNZA and dependencies
         run: |
-          pip install spacy==3.7.2 ginza==5.1.2
+          pip install spacy ginza
           python -m spacy download ja_ginza_electra
           pip install requests beautifulsoup4 supabase configparser
       - name: Run GiNZA Processor (Instance ${{ matrix.instance }})
